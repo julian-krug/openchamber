@@ -2217,13 +2217,13 @@ const resolveInitialUrl = async () => {
   if (envTarget) {
     apiBaseUrl = envTarget;
     clientToken = '';
-    initialUrl = shouldUsePackagedUi() ? localUiUrl : envTarget;
+    initialUrl = localUiUrl;
   } else if (config.defaultHostId && config.defaultHostId !== LOCAL_HOST_ID) {
     const host = config.hosts.find((entry) => entry.id === config.defaultHostId);
     if (host?.url) {
       apiBaseUrl = host.apiUrl || host.url;
       clientToken = host.clientToken || '';
-      initialUrl = shouldUsePackagedUi() ? localUiUrl : host.url;
+      initialUrl = localUiUrl;
     }
   }
 
