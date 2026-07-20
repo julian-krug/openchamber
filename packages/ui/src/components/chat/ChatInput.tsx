@@ -1,6 +1,7 @@
 import React from 'react';
 import { Textarea } from '@/components/ui/textarea';
 import { BrowserVoiceButton } from '@/components/voice';
+import { shouldFlushDraftAtSubmit, shouldRestoreVisibleInput, shouldClearDraftOnSuccess } from './chatInputDraftRecovery';
 // sessionStore removed — currentSessionId comes from useSessionUIStore
 import { useConfigStore } from '@/stores/useConfigStore';
 import { useUIStore } from '@/stores/useUIStore';
@@ -1827,8 +1828,12 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
 
         if (!primaryText && primaryAttachments.length === 0 && additionalParts.length === 0) return;
 
-        // Capture the raw input text before clearing, so we can restore it on connection errors.
+        // Capture the raw input text before clearing, so we can restore it on any send failure.
         const inputTextBeforeSend = !queuedOnly ? inputSnapshot.message : '';
+        // Snapshot the session ID at send time so the catch handler can restore
+        // the draft to the correct session even if the user has switched sessions
+        // by the time the promise rejects.
+        const sendSessionId = currentSessionId;
 
         // Clear queue and input
         if (currentSessionId && queuedMessageId) {
@@ -1837,10 +1842,31 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
             clearQueue(currentSessionId);
         }
         if (!queuedOnly) {
+            // Flush the exact sent text to localStorage *before* clearing the
+            // textarea.  This closes two races:
+            //
+            //  (a) Debounce race: typing schedules a 500 ms debounced persist.
+            //      setMessage('') below triggers a re-render that re-runs the
+            //      debounced effect with message='', which would cancel the
+            //      pending "hello world" timer and schedule a new one to persist
+            //      ''.  We cancel that pending timer here and set
+            //      skipNextDraftPersistRef so the effect triggered by the empty
+            //      message skips scheduling the empty write.
+            //
+            //  (b) Success-match race: shouldClearDraftOnSuccess reads
+            //      getStoredDraft() in the .then() handler.  If the debounce
+            //      had not yet fired, storedDraft would be stale/empty and the
+            //      match against sentText would fail, leaving a stale draft.
+            //      Flushing here ensures the stored value is always sentText.
+            if (shouldFlushDraftAtSubmit({ inputTextBeforeSend })) {
+                clearPendingDraftPersist();
+                persistDraftImmediately(sendSessionId, inputTextBeforeSend);
+                // Suppress the empty-draft write that setMessage('') will trigger.
+                skipNextDraftPersistRef.current = true;
+            }
+
             setMessage('');
             confirmedMentionsRef.current.clear();
-            // Clear per-session draft on submit
-            saveStoredDraft(currentSessionId, '');
             saveConfirmedMentions(currentSessionId, confirmedMentionsRef.current);
             // Reset message history navigation state
             setHistoryIndex(-1);
@@ -2103,7 +2129,20 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
         }
 
         void sendPromise.then(() => {
-            // Clear linked issue after successful message send
+            // Send succeeded: now safe to delete the persisted draft for the
+            // send-session.  Guard against two races:
+            //   (a) The user typed a new draft for this session while the send
+            //       was in-flight — storedDraft will differ from sentText, so
+            //       we leave it alone.
+            //   (b) The user switched to a different session — we only ever
+            //       touch sendSessionId's slot, never the current session's.
+            if (inputTextBeforeSend) {
+                const storedDraft = getStoredDraft(sendSessionId);
+                if (shouldClearDraftOnSuccess({ sendSessionId, sentText: inputTextBeforeSend, storedDraft })) {
+                    saveStoredDraft(sendSessionId, '');
+                }
+            }
+            // Clear linked issue/PR after successful message send
             if (linkedIssue) {
                 setLinkedIssue(null);
             }
@@ -2132,14 +2171,31 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
                 normalized.includes('gateway timeout') ||
                 normalized === 'failed to send message';
 
-            const isConnectionError =
-                normalized.includes('connection lost') ||
-                normalized.includes('not connected') ||
-                normalized.includes('never connected') ||
-                normalized.includes('please wait for reconnection');
+            // On any failure, persist the draft back to the send-session's
+            // localStorage slot so the text survives a page reload or session
+            // switch, regardless of whether the textarea is restored.
+            // currentSessionIdForDraftRef.current holds the live session ID
+            // (kept in sync via useEffect) so we can distinguish "still on
+            // the same session" from "user switched away".
+            const recoverDraft = () => {
+                if (!inputTextBeforeSend) return;
+                // Always write the draft back to the send-session's slot.
+                saveStoredDraft(sendSessionId, inputTextBeforeSend);
+                // Only restore the visible textarea when the user is still on
+                // the same session AND has not typed new text in the meantime.
+                if (shouldRestoreVisibleInput({
+                    inputTextBeforeSend,
+                    sendSessionId,
+                    currentSessionId: currentSessionIdForDraftRef.current,
+                    currentMessage: messageRef.current,
+                })) {
+                    setMessage(inputTextBeforeSend);
+                }
+            };
 
             if (normalized.includes('payload too large') || normalized.includes('413') || normalized.includes('entity too large')) {
                 toast.error(t('chat.chatInput.toast.attachmentsTooLarge'));
+                recoverDraft();
                 if (allAttachments.length > 0) {
                     useInputStore.getState().setAttachedFiles(allAttachments);
                 }
@@ -2147,19 +2203,19 @@ const ChatInputComponent: React.FC<ChatInputProps> = ({ onOpenSettings, scrollTo
             }
 
             if (isSoftNetworkError) {
+                recoverDraft();
                 if (allAttachments.length > 0) {
                     useInputStore.getState().setAttachedFiles(allAttachments);
                     toast.error(t('chat.chatInput.toast.sendAttachmentsFailed'));
+                } else {
+                    toast.error(rawMessage || t('chat.chatInput.toast.messageSendFailed'));
                 }
                 return;
             }
 
-            // Restore input text so the user doesn't lose their message when
-            // the connection is still pending (e.g. SSH remote instance connecting).
-            if (isConnectionError && inputTextBeforeSend) {
-                setMessage(inputTextBeforeSend);
-                saveStoredDraft(currentSessionId, inputTextBeforeSend);
-            }
+            // Connection errors, health-probe failures, and all other generic
+            // send failures: recover draft and show the error message.
+            recoverDraft();
 
             if (allAttachments.length > 0) {
                 useInputStore.getState().setAttachedFiles(allAttachments);
